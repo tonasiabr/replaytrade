@@ -23,6 +23,26 @@ class SwingTradeSimulator:
         self.speed = 500  # milliseconds
         self.animation_id = None
         
+	# ===== Indicadores (flags) =====
+        self.show_sma = False
+        self.show_ema = False
+        self.show_bb = False
+        self.show_rsi = False
+        self.show_macd = False
+        self.show_volume = False
+
+        # Zoom (quantidade de candles visíveis)
+        self.window_size = 50
+        self.min_window = 10
+        self.max_window = 200
+
+        # Períodos
+        self.sma_period = 20
+        self.ema_period = 9
+        self.bb_period = 20
+        self.bb_std = 2
+        self.rsi_period = 14
+
         # Controle de trades
         self.initial_capital = 10000.0
         self.capital = self.initial_capital
@@ -30,7 +50,164 @@ class SwingTradeSimulator:
         self.trades_history = []
         self.equity_curve = []
         
+        self.df_plot = None
+        self.tooltip = None
+        self.start_idx = 0
+  
         self.setup_ui()
+
+    def toggle_indicator(self, name):
+        setattr(self, f"show_{name}", not getattr(self, f"show_{name}"))
+        self.plot_candles()
+
+    def calculate_indicators(self):
+        df = self.df
+
+        df["SMA"] = df["Close"].rolling(self.sma_period).mean()
+        df["EMA"] = df["Close"].ewm(span=self.ema_period, adjust=False).mean()
+
+        # Bollinger
+        ma = df["Close"].rolling(self.bb_period).mean()
+        std = df["Close"].rolling(self.bb_period).std()
+        df["BB_UP"] = ma + self.bb_std * std
+        df["BB_DN"] = ma - self.bb_std * std
+
+        # RSI
+        delta = df["Close"].diff()
+        gain = delta.clip(lower=0)
+        loss = -delta.clip(upper=0)
+        avg_gain = gain.rolling(self.rsi_period).mean()
+        avg_loss = loss.rolling(self.rsi_period).mean()
+        rs = avg_gain / avg_loss
+        df["RSI"] = 100 - (100 / (1 + rs))
+
+        # MACD
+        ema12 = df["Close"].ewm(span=12, adjust=False).mean()
+        ema26 = df["Close"].ewm(span=26, adjust=False).mean()
+        df["MACD"] = ema12 - ema26
+        df["MACD_SIGNAL"] = df["MACD"].ewm(span=9, adjust=False).mean()
+
+    def zoom_in(self, event=None):
+        if self.window_size > self.min_window:
+            self.window_size -= 5
+            self.plot_candles()
+            print(f"zoom: {self.window_size}")
+
+    def zoom_out(self, event=None):
+        if self.window_size < self.max_window:
+            self.window_size += 5
+            self.plot_candles()
+            print(f"zoom: {self.window_size}")
+
+    def on_mouse_move_old(self, event):
+        # Segurança total
+        if self.df_plot is None or self.tooltip is None:
+            return
+
+        # === CTRL OBRIGATÓRIO ===
+        if event.key is None or "control" not in event.key:
+            self.tooltip.set_visible(False)
+            self.canvas.draw_idle()
+            return
+
+        if event.inaxes != self.ax_price:
+            self.tooltip.set_visible(False)
+            self.canvas.draw_idle()
+            return
+
+        if event.xdata is None:
+            self.tooltip.set_visible(False)
+            self.canvas.draw_idle()
+            return
+
+        x = int(round(event.xdata))
+
+        if x < 0 or x >= len(self.df_plot):
+            self.tooltip.set_visible(False)
+            self.canvas.draw_idle()
+            return
+
+        row = self.df_plot.iloc[x]
+
+        text = (
+            f"Data: {row['Date'].strftime('%d/%m/%Y')}\n"
+            f"Open:  {row['Open']:.2f}\n"
+            f"High:  {row['High']:.2f}\n"
+            f"Low:   {row['Low']:.2f}\n"
+            f"Close: {row['Close']:.2f}\n"
+            f"Vol:   {int(row['Volume'])}"
+        )
+
+        self.tooltip.xy = (x, row['High'])
+        self.tooltip.set_text(text)
+        self.tooltip.set_visible(True)
+
+        self.canvas.draw_idle()
+
+    def on_mouse_move(self, event):
+
+        # Segurança total
+        if self.df_plot is None or self.tooltip is None:
+            return
+
+        # Só mostra se Ctrl estiver pressionado
+        if event.key != "control":
+            if self.tooltip.get_visible():
+                self.tooltip.set_visible(False)
+                self.canvas.draw_idle()
+            return
+        	
+        # Mouse fora do eixo
+        if event.inaxes != self.ax:
+            if self.tooltip.get_visible():
+                self.tooltip.set_visible(False)
+                self.canvas.draw_idle()
+            #return
+        
+        # Coordenada X (índice do candle)
+        if event.xdata is None:
+            return
+        
+        x = int(round(event.xdata))
+
+        # Fora do range dos candles
+        if x < 0 or x >= len(self.df_plot):
+            if self.tooltip.get_visible():
+                self.tooltip.set_visible(False)
+                self.canvas.draw_idle()
+            return
+        
+        # Dados do candle
+        row = self.df_plot.iloc[x]
+
+        texto = (
+            f"Data: {row['Date'].strftime('%d/%m/%Y')}\n"
+            f"Abertura: {row['Open']:.2f}\n"
+            f"Máxima: {row['High']:.2f}\n"
+            f"Mínima: {row['Low']:.2f}\n"
+            f"Fechamento: {row['Close']:.2f}\n"
+            f"Volume: {int(row['Volume']):,}".replace(",", ".")
+        )
+
+        # Posiciona tooltip no candle
+        self.tooltip.xy = (x, row["High"])
+        self.tooltip.set_text(texto)
+
+        # === Ajuste automático de borda ===
+        total = len(self.df_plot)
+        limite_direita = int(total * 0.75)
+
+        if x >= limite_direita:
+            self.tooltip.xytext = (-220, 15)
+            self.tooltip.set_ha("right")
+        else:
+            self.tooltip.xytext = (15, 15)
+            self.tooltip.set_ha("left")
+
+        # Exibe tooltip
+        self.tooltip.set_visible(True)
+        self.canvas.draw_idle()
+
         
     def setup_ui(self):
         # Frame superior para controles
@@ -85,7 +262,7 @@ class SwingTradeSimulator:
         
         # Velocidade
         tk.Label(control_frame, text="Velocidade:", bg='#2b2b2b', fg='white', font=('Arial', 10)).pack(side=tk.LEFT, padx=5)
-        self.speed_scale = tk.Scale(control_frame, from_=100, to=2000, orient=tk.HORIZONTAL,
+        self.speed_scale = tk.Scale(control_frame, from_=10, to=2000, orient=tk.HORIZONTAL,
                                    command=self.update_speed, bg='#4a4a4a', fg='white',
                                    length=150, troughcolor='#666666')
         self.speed_scale.set(500)
@@ -107,6 +284,10 @@ class SwingTradeSimulator:
         self.canvas = FigureCanvasTkAgg(self.fig, master=left_frame)
         self.canvas.draw()
         self.canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
+
+        # conexão do mouse (AQUI)
+        self.canvas.mpl_connect("motion_notify_event", self.on_mouse_move)
+
         
         # Frame direito (estatísticas)
         right_frame = tk.Frame(main_frame, bg='#2b2b2b', width=300)
@@ -146,6 +327,27 @@ class SwingTradeSimulator:
         self.status_bar = tk.Label(self.root, text="Carregue uma ação para começar", 
                                   bg='#3a3a3a', fg='white', anchor=tk.W, font=('Arial', 9))
         self.status_bar.pack(side=tk.BOTTOM, fill=tk.X)
+
+        # ===== Atalhos =====
+        self.root.bind("1", lambda e: self.toggle_indicator("sma"))
+        self.root.bind("2", lambda e: self.toggle_indicator("ema"))
+        self.root.bind("3", lambda e: self.toggle_indicator("bb"))
+        self.root.bind("4", lambda e: self.toggle_indicator("rsi"))
+        self.root.bind("5", lambda e: self.toggle_indicator("macd"))
+        self.root.bind("6", lambda e: self.toggle_indicator("volume"))
+        self.root.bind("+", self.zoom_in)
+        self.root.bind("-", self.zoom_out)
+
+        '''
+ATALHOS do ROOT.BIND
+1 = SMA
+2 = EMA
+3 = Bollinger
+4 = RSI
+5 = MACD
+6 = Volume
++/-=mais ou menos candles
+        '''
         
     def create_stats_labels(self):
         stats = [
@@ -207,6 +409,7 @@ class SwingTradeSimulator:
                 return
             
             self.df = df_temp
+            self.calculate_indicators()
             self.current_index = min(50, len(self.df))
             
             # Resetar trading
@@ -233,76 +436,161 @@ class SwingTradeSimulator:
     def plot_candles(self):
         if self.df is None or len(self.df) == 0:
             return
-        
-        self.ax.clear()
-        
-        # Pegar últimos 50 candles até o índice atual
+
+        # ===== Limpar figura =====
+        self.fig.clear()
+
+        # ===== Quantos subplots =====
+        rows = 1
+        if self.show_volume:
+            rows += 1
+        if self.show_rsi:
+            rows += 1
+        if self.show_macd:
+            rows += 1
+
+        # ===== Criar eixos =====
+        self.ax_price = self.fig.add_subplot(rows, 1, 1)
+        current_row = 2
+
+        if self.show_volume:
+            self.ax_volume = self.fig.add_subplot(rows, 1, current_row, sharex=self.ax_price)
+            current_row += 1
+
+        if self.show_rsi:
+            self.ax_rsi = self.fig.add_subplot(rows, 1, current_row, sharex=self.ax_price)
+            current_row += 1
+
+        if self.show_macd:
+            self.ax_macd = self.fig.add_subplot(rows, 1, current_row, sharex=self.ax_price)
+
+        # ===== Cor de fundo =====
+        bg = '#2b2b2b'
+
+        self.fig.patch.set_facecolor(bg)
+        self.ax_price.set_facecolor(bg)
+
+        if self.show_volume:
+            self.ax_volume.set_facecolor(bg)
+
+        if self.show_rsi:
+            self.ax_rsi.set_facecolor(bg)
+
+        if self.show_macd:
+            self.ax_macd.set_facecolor(bg)
+
+        # ===== Ajuste das cores dos eixos =====
+        for ax in self.fig.axes:
+            ax.tick_params(colors='white')
+            ax.yaxis.label.set_color('white')
+            ax.xaxis.label.set_color('white')
+            ax.title.set_color('white')
+            ax.grid(True, alpha=0.2, color='gray')
+
+
+        # ===== Janela de candles =====
+        # trocando pela linha de baixo, para controlar por + ou - 
         start_idx = max(0, self.current_index - 50)
+
+        #ficou feio assim, usando o anterior start_idx = max(0, self.current_index - self.window_size)
         end_idx = self.current_index
-        
         df_slice = self.df.iloc[start_idx:end_idx].copy()
-        
+
         if len(df_slice) == 0:
             return
-        
-        # Plotar candles
-        for idx, row in df_slice.iterrows():
-            date_num = idx - start_idx
+
+        x = range(len(df_slice))
+
+        # ===== Plotar candles =====
+        for i, (_, row) in enumerate(df_slice.iterrows()):
             open_price = row['Open']
             close_price = row['Close']
             high_price = row['High']
             low_price = row['Low']
-            
+
             color = '#00ff00' if close_price >= open_price else '#ff0000'
-            
-            # Corpo do candle
             height = abs(close_price - open_price)
             bottom = min(open_price, close_price)
-            
-            self.ax.add_patch(Rectangle((date_num - 0.3, bottom), 0.6, height,
-                                       facecolor=color, edgecolor=color, alpha=0.8))
-            
-            # Sombra (pavio)
-            self.ax.plot([date_num, date_num], [low_price, high_price],
-                        color=color, linewidth=1, alpha=0.8)
-        
-        # Marcar posição de compra se existir
+
+            self.ax_price.add_patch(
+                Rectangle((i - 0.3, bottom), 0.6, height,
+                          facecolor=color, edgecolor=color, alpha=0.8)
+            )
+
+            self.ax_price.plot([i, i], [low_price, high_price],
+                               color=color, linewidth=1)
+
+        # ===== Indicadores no preço =====
+        if self.show_sma:
+            self.ax_price.plot(x, df_slice["SMA"], color="yellow", linewidth=1, label="SMA")
+
+        if self.show_ema:
+            self.ax_price.plot(x, df_slice["EMA"], color="cyan", linewidth=1, label="EMA")
+
+        if self.show_bb:
+            self.ax_price.plot(x, df_slice["BB_UP"], color="gray", linestyle="--", linewidth=1)
+            self.ax_price.plot(x, df_slice["BB_DN"], color="gray", linestyle="--", linewidth=1)
+
+        # ===== Marcar compra =====
         if self.position:
             entry_date = self.position['entry_date']
-            # CORREÇÃO: Usar any() para verificar se existe
-            date_match = (df_slice['Date'] == entry_date).any()
-            if date_match:
+            if (df_slice['Date'] == entry_date).any():
                 entry_idx = df_slice[df_slice['Date'] == entry_date].index[0] - start_idx
                 entry_price = self.position['entry_price']
-                self.ax.plot(entry_idx, entry_price, 'g^', markersize=15, 
-                           label=f'Compra: R$ {entry_price:.2f}')
-                # Linha horizontal do preço de entrada
-                self.ax.axhline(y=entry_price, color='green', linestyle='--', 
-                              alpha=0.5, linewidth=1)
-        
-        # Configurar eixos
-        self.ax.set_xlim(-1, 50)
-        self.ax.set_xlabel('Candles', color='white', fontsize=10)
-        self.ax.set_ylabel('Preço (R$)', color='white', fontsize=10)
-        self.ax.tick_params(colors='white')
-        self.ax.grid(True, alpha=0.2, color='gray')
-        self.ax.set_facecolor('#2b2b2b')
-        
-        # Título com data atual
-        if len(df_slice) > 0:
-            current_date = df_slice.iloc[-1]['Date']
-            current_close = df_slice.iloc[-1]['Close']
-            self.ax.set_title(f'{self.ticker_entry.get()} - {current_date.strftime("%d/%m/%Y")} - '
-                            f'Fechamento: R$ {current_close:.2f}',
-                            color='white', fontsize=12, pad=10)
-        
-        if self.position:
-            self.ax.legend(loc='upper left', facecolor='#2b2b2b', 
-                         edgecolor='white', labelcolor='white')
-        
+                self.ax_price.plot(entry_idx, entry_price, 'g^', markersize=14)
+                self.ax_price.axhline(entry_price, color='green', linestyle='--', alpha=0.5)
+
+        # ===== Volume =====
+        if self.show_volume:
+            self.ax_volume.bar(x, df_slice["Volume"], alpha=0.3)
+            self.ax_volume.set_ylabel("Volume")
+
+        # ===== RSI =====
+        if self.show_rsi:
+            self.ax_rsi.plot(x, df_slice["RSI"], color="orange")
+            self.ax_rsi.axhline(70, color="red", linestyle="--")
+            self.ax_rsi.axhline(30, color="green", linestyle="--")
+            self.ax_rsi.set_ylim(0, 100)
+            self.ax_rsi.set_ylabel("RSI")
+
+        # ===== MACD =====
+        if self.show_macd:
+            self.ax_macd.plot(x, df_slice["MACD"], label="MACD")
+            self.ax_macd.plot(x, df_slice["MACD_SIGNAL"], label="Signal")
+            self.ax_macd.legend()
+
+        # ===== Estética =====
+        self.ax_price.set_xlim(-1, len(df_slice))
+        self.ax_price.grid(True, alpha=0.2)
+
+        current_date = df_slice.iloc[-1]['Date']
+        current_close = df_slice.iloc[-1]['Close']
+
+        self.ax_price.set_title(
+            f'{self.ticker_entry.get()} - {current_date.strftime("%d/%m/%Y")} '
+            f'- Fechamento: R$ {current_close:.2f}'
+        )
+
         self.fig.tight_layout()
         self.canvas.draw()
-    
+        
+        # ===== Tooltip (recriado a cada redraw) =====
+        self.tooltip = self.ax_price.annotate(
+            "",
+            xy=(0, 0),
+            xytext=(15, 15),
+            textcoords="offset points",
+            bbox=dict(boxstyle="round", fc="#1e1e1e", ec="white"),
+            arrowprops=dict(arrowstyle="->"),
+            color="white"
+        )
+        self.tooltip.set_visible(False)
+
+
+        # para o tooltip
+        self.df_plot = df_slice.reset_index(drop=True)
+        self.start_idx = start_idx
+
     def toggle_play(self):
         if self.df is None:
             messagebox.showwarning("Aviso", "Carregue uma ação primeiro")
